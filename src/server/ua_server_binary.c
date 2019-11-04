@@ -41,6 +41,134 @@ void UA_debug_dumpCompleteChunk(UA_Server *const server, UA_Connection *const co
 /* Helper Functions */
 /********************/
 
+// Longitud maxima de una linea del log
+#define LOG_LINE_MAX_SIZE 250
+
+/**
+ * Helper para poder llamar a logger.log y pasar un va_list
+ */
+static void loggerHelper(UA_Server* server, UA_LogLevel level, UA_LogCategory category, const char *msg, ...)
+{
+	va_list args; va_start(args, msg);
+	server->config.logger.log(server->config.logger.context, level, UA_LOGCATEGORY_USERLAND, msg, args);
+	va_end(args);
+}
+
+/**
+ * Agregar el id de un nodo al final del string
+ * @param str       String que sera concatenado
+ * @param nodeId    NodeId que se va a agregar
+ * @return          1 (true) si se ha podido, 0 (false) si no hay espacio
+ * @remark          Si no hay suficiente espacio (size() > LOG_LINE_MAX_SIZE) se agregar " ..."
+ */
+static int appendNodeId(char* str, const UA_NodeId* nodeId)
+{
+	// UA_NodeId -> UA_String
+	UA_String nodeIdStr;
+	UA_String_init(&nodeIdStr);
+	if (nodeId->identifierType == UA_NODEIDTYPE_STRING)
+		nodeIdStr = nodeId->identifier.string;
+	else
+		UA_NodeId_toString(nodeId, &nodeIdStr);
+
+	// UA_String -> C string
+	char tmp[100];
+	sprintf(tmp, "%.*s ", (int)nodeIdStr.length, nodeIdStr.data);
+
+	// limpiar UA_String
+	if (nodeId->identifierType != UA_NODEIDTYPE_STRING)
+		UA_String_deleteMembers(&nodeIdStr);
+
+	// mirar si hay espacio
+	size_t len = strlen(str);
+	if (len + nodeIdStr.length + 5 < LOG_LINE_MAX_SIZE) // + 5 para poder agregar " ...\0"
+	{
+		// entra
+		if (strstr(str, tmp) == NULL)
+			// solo si no esta repetido
+			strcat(str + len, tmp); // + len para que no pierda tiempo recorriendo str
+		return 1;
+	}
+	else
+	{
+		// no hay espacio
+		strcat(str + len, " ..."); // + len para que no pierda tiempo recorriendo str
+		return 0;
+	}
+}
+
+/**
+ * Agrega una linea al log
+ */
+static void customLogger(UA_Server* server, const UA_DataType* requestType, UA_SecureChannel* channel, UA_Session* session, const UA_RequestHeader* request)
+{
+	UA_LogLevel level = UA_LOGLEVEL_DEBUG;  // nivel por defecto
+	char logStr[LOG_LINE_MAX_SIZE];         // buffer donde se va construyendo el texto log
+	int maxReached = 0; // bool             // Si logStr ha alcanzado la longitud maxima
+
+	// Obtener la ip
+	struct sockaddr_in peer;
+	unsigned int peer_len = sizeof(peer);
+	char* ip = NULL;
+	if (getpeername(channel->connection->sockfd, (struct sockaddr*)&peer, &peer_len) != -1)
+		ip = inet_ntoa(peer.sin_addr);
+
+	// xxx.xxx.xxx.xxx Tipo_de_pedido
+	sprintf(logStr, "%s  %s ",  ip, requestType->typeName);
+
+	switch(requestType->binaryEncodingId)
+	{
+		case UA_NS0ID_READREQUEST_ENCODING_DEFAULTBINARY: // ReadRequest
+			level = UA_LOGLEVEL_INFO;
+			for (size_t i = 0; i < ((const UA_ReadRequest*)request)->nodesToReadSize && maxReached == 0; ++i)
+				maxReached = !appendNodeId(logStr, &((const UA_ReadRequest*)request)->nodesToRead[i].nodeId);
+			break;
+
+		case UA_NS0ID_WRITEREQUEST_ENCODING_DEFAULTBINARY: // WriteRequest
+			level = UA_LOGLEVEL_INFO;
+			for (size_t i = 0; i < ((const UA_WriteRequest*)request)->nodesToWriteSize && maxReached == 0; ++i)
+				maxReached = !appendNodeId(logStr, &((const UA_WriteRequest*)request)->nodesToWrite[i].nodeId);
+			break;
+
+		case UA_NS0ID_CREATEMONITOREDITEMSREQUEST_ENCODING_DEFAULTBINARY: // CreateMonitoredItemRequest
+			level = UA_LOGLEVEL_DEBUG;
+			for (size_t i = 0; i < ((const UA_CreateMonitoredItemsRequest*)request)->itemsToCreateSize && maxReached == 0; ++i)
+				maxReached = !appendNodeId(logStr, &((const UA_CreateMonitoredItemsRequest*)request)->itemsToCreate[i].itemToMonitor.nodeId);
+			break;
+
+		case UA_NS0ID_BROWSEREQUEST_ENCODING_DEFAULTBINARY: // BrowseRequest
+			level = UA_LOGLEVEL_INFO;
+			for (size_t i = 0; i < ((const UA_BrowseRequest*)request)->nodesToBrowseSize && maxReached == 0; ++i)
+				maxReached = !appendNodeId(logStr, &((const UA_BrowseRequest*)request)->nodesToBrowse[i].nodeId);
+			break;
+
+		case UA_NS0ID_PUBLISHREQUEST_ENCODING_DEFAULTBINARY: // PublishRequest
+			level = UA_LOGLEVEL_INFO;
+			for (size_t i = 0; i < ((const UA_PublishRequest*)request)->subscriptionAcknowledgementsSize && maxReached == 0; ++i)
+			{
+				UA_Subscription* subs = UA_Session_getSubscriptionById(session, ((const UA_PublishRequest*)request)->subscriptionAcknowledgements[i].subscriptionId);
+				UA_MonitoredItem* item = subs->monitoredItems.lh_first;
+				for (size_t numItem = 0; numItem < subs->monitoredItemsSize && maxReached == 0; ++numItem)
+				{
+					maxReached = !appendNodeId(logStr, &item->monitoredNodeId);
+					item = item->listEntry.le_next;
+				}
+			}
+			break;
+
+//#ifdef UA_ENABLE_METHODCALLS // CallRequest
+//    case UA_NS0ID_CALLREQUEST_ENCODING_DEFAULTBINARY:
+//      level = UA_LOGLEVEL_INFO;
+//      for (size_t i = 0; i < ((UA_CallRequest*)request)->methodsToCallSize && maxReached == 0; ++i)
+//          maxReached = !appendNodeId(requestStr, &((UA_CallRequest*)request)->methodsToCall[i].methodId);
+//        break;
+//#endif
+	}
+
+	// Llamar a la funcion de log
+	loggerHelper(server, level, UA_LOGCATEGORY_NETWORK, logStr);
+}
+
 static UA_StatusCode
 sendServiceFaultWithRequest(UA_SecureChannel *channel,
                             const UA_RequestHeader *requestHeader,
@@ -529,6 +657,8 @@ processMSGDecoded(UA_Server *server, UA_SecureChannel *channel, UA_UInt32 reques
 
     /* Update the session lifetime */
     UA_Session_updateLifetime(session);
+
+	customLogger(server, requestType, channel, session, requestHeader);
 
 #ifdef UA_ENABLE_SUBSCRIPTIONS
     /* The publish request is not answered immediately */

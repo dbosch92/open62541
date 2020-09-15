@@ -50,7 +50,7 @@ void UA_debug_dumpCompleteChunk(UA_Server *const server, UA_Connection *const co
 static void loggerHelper(UA_Server* server, UA_LogLevel level, UA_LogCategory category, const char *msg, ...)
 {
 	va_list args; va_start(args, msg);
-	server->config.logger.log(server->config.logger.context, level, UA_LOGCATEGORY_USERLAND, msg, args);
+	server->config.logger.log(server->config.logger.context, level, category, msg, args);
 	va_end(args);
 }
 
